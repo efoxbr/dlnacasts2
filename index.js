@@ -1,330 +1,215 @@
-var castv2 = require('castv2-client')
-var debug = require('debug')('chromecasts')
-var events = require('events')
-var get = require('simple-get')
-var mdns = require('multicast-dns')
-var mime = require('mime')
-var parseString = require('xml2js').parseString
-var txt = require('dns-txt')()
+const MediaRenderer = require('upnp-mediarenderer-client')
+const events = require('events')
+const mime = require('mime')
+const parallel = require('run-parallel')
+const net = require('net')
+const RendererFinder = require('renderer-finder');
+const thunky = require('thunky')
+const noop = function () {}
 
-var SSDP
-try {
-  SSDP = require('node-ssdp').Client
-} catch (err) {
-  SSDP = null
-}
+module.exports = function (ip, knownDevices) {
+  const that = new events.EventEmitter()
+  const casts = {}
 
-var thunky = require('thunky')
-var url = require('url')
-
-var noop = function () {}
-var toMap = function (url) {
-  return typeof url === 'string' ? {url: url} : url
-}
-var toSubtitles = function (url, i) {
-  if (typeof url !== 'string') return url
-  return {
-    trackId: i + 1,
-    type: 'TEXT',
-    trackContentId: url,
-    trackContentType: 'text/vtt',
-    name: 'English',
-    language: 'en-US',
-    subtype: 'SUBTITLES'
-  }
-}
-
-module.exports = function () {
-  var dns = mdns()
-  var that = new events.EventEmitter()
-  var casts = {}
-  var ssdp = SSDP ? new SSDP({logLevel: process.env.DEBUG ? 'trace' : false}) : null
-
+  that.knownDevices = Array.isArray(knownDevices) ? knownDevices : []
   that.players = []
 
-  var emit = function (cst) {
+  const emit = function (cst) {
     if (!cst || !cst.host || cst.emitted) return
     cst.emitted = true
 
-    var player = new events.EventEmitter()
+    const player = new events.EventEmitter()
 
-    var connect = thunky(function reconnect (cb) {
-      var client = new castv2.Client()
+    const connect = thunky(function reconnect (cb) {
+      const client = new MediaRenderer(player.xml)
 
       client.on('error', function (err) {
         player.emit('error', err)
       })
 
+      client.on('status', function (status) {
+        if (status.TransportState === 'PLAYING') player._status.playerState = 'PLAYING'
+        if (status.TransportState === 'PAUSED_PLAYBACK') player._status.playerState = 'PAUSED'
+        player.emit('status', player._status)
+      })
+
+      client.on('loading', function (err) {
+        player.emit('loading', err)
+      })
+
       client.on('close', function () {
         connect = thunky(reconnect)
       })
 
-      client.client.on('close', function () {
-        connect = thunky(reconnect)
-      })
-
-      client.connect(player.host, function (err) {
-        if (err) return cb(err)
-        player.emit('connect')
-
-        client.getSessions(function (err, sess) {
-          if (err) return cb(err)
-
-          var session = sess[0]
-          if (session && session.appId === castv2.DefaultMediaReceiver.APP_ID) {
-            client.join(session, castv2.DefaultMediaReceiver, ready)
-          } else {
-            client.launch(castv2.DefaultMediaReceiver, ready)
-          }
-        })
-
-        function ready (err, p) {
-          if (err) return cb(err)
-
-          player.emit('ready')
-
-          p.on('close', function () {
-            connect = thunky(reconnect)
-          })
-
-          p.on('status', function (status) {
-            player.emit('status', status)
-          })
-
-          cb(null, p)
-        }
-      })
+      player.client = client
+      cb(null, player.client)
     })
 
-    var connectClient = thunky(function reconnectClient (cb) {
-      var client = new castv2.Client()
-
-      client.on('error', function () {
-        connectClient = thunky(reconnectClient)
-      })
-
-      client.on('close', function () {
-        connectClient = thunky(reconnectClient)
-      })
-
-      client.connect(player.host, function (err) {
-        if (err) return cb(err)
-        cb(null, client)
-      })
-    })
+    const parseTime = function (time) {
+      if (!time || time.indexOf(':') === -1) return 0
+      const parts = time.split(':').map(Number)
+      return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    }
 
     player.name = cst.name
     player.host = cst.host
-
-    player.client = function (cb) {
-      connectClient(cb)
-    }
-
-    player.chromecastStatus = function (cb) {
-      connectClient(function (err, client) {
-        if (err) return cb(err)
-        client.getStatus(cb)
-      })
-    }
+    player.xml = cst.xml
+    player._status = {}
+    player.MAX_VOLUME = 100
 
     player.play = function (url, opts, cb) {
       if (typeof opts === 'function') return player.play(url, null, opts)
       if (!opts) opts = {}
       if (!url) return player.resume(cb)
       if (!cb) cb = noop
+      player.subtitles = opts.subtitles
       connect(function (err, p) {
         if (err) return cb(err)
 
-        var media = {
-          contentId: url,
+        const media = {
+          autoplay: opts.autoPlay !== false,
           contentType: opts.type || mime.lookup(url, 'video/mp4'),
-          streamType: opts.streamType || 'BUFFERED',
-          tracks: [].concat(opts.subtitles || []).map(toSubtitles),
-          textTrackStyle: opts.textTrackStyle,
           metadata: opts.metadata || {
-            type: 0,
-            metadataType: 0,
             title: opts.title || '',
-            images: [].concat(opts.images || []).map(toMap)
+            type: 'video', // can be 'video', 'audio' or 'image'
+            subtitlesUrl: player.subtitles && player.subtitles.length ? player.subtitles[0] : null
+          }
+        }
+        if (opts.dlnaFeatures) {
+          media.dlnaFeatures = opts.dlnaFeatures;
+        }
+
+        var callback = cb
+        if (opts.seek) {
+          callback = function () {
+            player.seek(opts.seek, cb)
           }
         }
 
-        var autoSubtitles = opts.autoSubtitles
-        if (autoSubtitles === false) autoSubtitles = 0
-        if (autoSubtitles === true) autoSubtitles = 1
-
-        var playerOptions = {
-          autoplay: opts.autoPlay !== false,
-          currentTime: opts.seek,
-          activeTrackIds: opts.subtitles && (autoSubtitles === 0 ? [] : [autoSubtitles || 1])
-        }
-
-        p.load(media, playerOptions, cb)
+        p.load(url, media, callback)
       })
     }
 
     player.resume = function (cb) {
       if (!cb) cb = noop
-      connect(function (err, p) {
-        if (err) return cb(err)
-        p.play(cb)
-      })
+      player.client.play(cb)
     }
 
     player.pause = function (cb) {
       if (!cb) cb = noop
-      connect(function (err, p) {
-        if (err) return cb(err)
-        p.pause(cb)
-      })
+      player.client.pause(cb)
     }
 
     player.stop = function (cb) {
       if (!cb) cb = noop
-      connect(function (err, p) {
-        if (err) return cb(err)
-        p.stop(cb)
-      })
+      player.client.stop(cb)
     }
 
     player.status = function (cb) {
-      connect(function (err, p) {
-        if (err) return cb(err)
-        p.getStatus(cb)
+      if (!cb) cb = noop
+      parallel({
+        currentTime: function (acb) {
+          const params = {
+            InstanceID: player.client.instanceId
+          }
+          player.client.callAction('AVTransport', 'GetPositionInfo', params, function (err, res) {
+            if (err) return
+            const position = parseTime(res.AbsTime) | parseTime(res.RelTime)
+            acb(null, position)
+          })
+        },
+        volume: function (acb) {
+          player._volume(acb)
+        }
+      },
+      function (err, results) {
+        player._status.currentTime = results.currentTime
+        player._status.volume = {level: results.volume / (player.MAX_VOLUME)}
+        return cb(err, player._status)
       })
     }
 
-    player.subtitles = function (id, cb) {
-      if (!cb) cb = noop
-      connect(function (err, p) {
-        if (err) return cb(err)
-
-        player.request({
-          type: 'EDIT_TRACKS_INFO',
-          activeTrackIds: id ? [id === true ? 1 : id] : []
-        }, cb)
+    player._volume = function (cb) {
+      const params = {
+        InstanceID: player.client.instanceId,
+        Channel: 'Master'
+      }
+      player.client.callAction('RenderingControl', 'GetVolume', params, function (err, res) {
+        if (err) return
+        const volume = res.CurrentVolume ? parseInt(res.CurrentVolume) : 0
+        cb(null, volume)
       })
     }
 
     player.volume = function (vol, cb) {
       if (!cb) cb = noop
-      connect(function (err, p) {
-        if (err) return cb(err)
-
-        player.request({
-          type: 'SET_VOLUME',
-          volume: vol === 0 ? { muted: true } : { level: vol, muted: false }
-        }, cb)
-      })
+      const params = {
+        InstanceID: player.client.instanceId,
+        Channel: 'Master',
+        DesiredVolume: (player.MAX_VOLUME * vol) | 0
+      }
+      player.client.callAction('RenderingControl', 'SetVolume', params, cb)
     }
 
-    player.playbackRate = function (rate, cb) {
+    player.request = function (target, action, data, cb) {
       if (!cb) cb = noop
-      connect(function (err, p) {
-        if (err) return cb(err)
-
-        player.request({
-          type: 'SET_PLAYBACK_RATE',
-          playbackRate: rate
-        }, cb)
-      })
-    }
-
-    player.request = function (data, cb) {
-      if (!cb) cb = noop
-      connect(function (err, p) {
-        if (err) return cb(err)
-        p.media.sessionRequest(data, cb)
-      })
+      player.client.callAction(target, action, data, cb)
     }
 
     player.seek = function (time, cb) {
       if (!cb) cb = noop
-      connect(function (err, p) {
-        if (err) return cb(err)
-        p.seek(time, cb)
+      player.client.seek(time, cb)
+    }
+
+    player._detectVolume = function (cb) {
+      if (!cb) cb = noop
+      player._volume(function (err, currentVolume) {
+        if (err) cb(err)
+        player.volume(player.MAX_VOLUME, function (err) {
+          if (err) cb(err)
+          player._volume(function (err, maxVolume) {
+            if (err) cb(err)
+            player.MAX_VOLUME = maxVolume
+            player.volume(currentVolume, function (err) {
+              cb(err, maxVolume)
+            })
+          })
+        })
       })
     }
 
     that.players.push(player)
     that.emit('update', player)
   }
-
-  dns.on('response', function (response) {
-    response.answers.forEach(function (a) {
-      if (a.type === 'PTR' && a.name === '_googlecast._tcp.local') {
-        var name = a.data
-        var shortname = a.data.replace('._googlecast._tcp.local', '')
-        if (!casts[name]) casts[name] = {name: shortname, host: null}
-      }
-    })
-
-    var onanswer = function (a) {
-      debug('got answer %j', a)
-
-      var name = a.name
-      if (a.type === 'SRV' && casts[name] && !casts[name].host) {
-        casts[name].host = a.data.target
-        emit(casts[name])
-      }
-
-      if (a.type === 'TXT' && casts[name]) {
-        var text = txt.decode(a.data)
-        if (text.fn) {
-          casts[name].name = text.fn
-          emit(casts[name])
+  
+  that.update = () => {
+    const finder = new RendererFinder()
+    finder.on('found', (info, msg, desc) => {
+      const host = info.address
+      const xml = msg.location
+      const name = desc.device.friendlyName
+      const headers = {}
+      if (!casts[name]) {
+        casts[name] = {name, host, xml, headers}
+        return emit(casts[name])
+      } else {
+        if(!casts[name].host || !net.isIP(casts[name].host) || net.isIP(casts[name].host) == 4){ // prefer ipv4
+          casts[name].host = host
+          casts[name].xml = xml
+          casts[name].headers = headers
+          casts[name].emitted = false // re-emit with the new host
+          return emit(casts[name])
         }
       }
-    }
-
-    response.additionals.forEach(onanswer)
-    response.answers.forEach(onanswer)
-  })
-
-  if (ssdp) {
-    ssdp.on('response', function (headers, statusCode, info) {
-      if (!headers.LOCATION) return
-
-      get.concat(headers.LOCATION, function (err, res, body) {
-        if (err) return
-        parseString(body.toString(), {explicitArray: false, explicitRoot: false},
-          function (err, service) {
-            if (err) return
-            if (!service.device) return
-
-            debug('device %j', service.device)
-
-            var name = service.device.friendlyName
-
-            if (!name) return
-
-            var host = url.parse(service.URLBase).hostname
-
-            if (!casts[name]) {
-              casts[name] = {name: name, host: host}
-              return emit(casts[name])
-            }
-
-            if (casts[name] && !casts[name].host) {
-              casts[name].host = host
-              emit(casts[name])
-            }
-          })
-      })
     })
-  }
-
-  that.update = function () {
-    debug('querying mdns and ssdp')
-    if (ssdp) ssdp.search('urn:dial-multiscreen-org:device:dial:1')
-    dns.query('_googlecast._tcp.local', 'PTR')
+    finder.start(true)
   }
 
   that.destroy = function () {
-    dns.destroy()
   }
 
   that.update()
+
 
   return that
 }
