@@ -3,15 +3,15 @@ const events = require('events')
 const mime = require('mime')
 const parallel = require('run-parallel')
 const net = require('net')
+const http   = require('http')
 const RendererFinder = require('renderer-finder');
 const thunky = require('thunky')
 const noop = function () {}
 
-module.exports = function (ip, knownDevices) {
+module.exports = function () {
   const that = new events.EventEmitter()
   const casts = {}
 
-  that.knownDevices = Array.isArray(knownDevices) ? knownDevices : []
   that.players = []
 
   const emit = function (cst) {
@@ -181,6 +181,20 @@ module.exports = function (ip, knownDevices) {
     that.players.push(player)
     that.emit('update', player)
   }
+
+  const found = (name, host, xml) => {
+    if (!casts[name]) {
+      casts[name] = {name, host, xml}
+      return emit(casts[name])
+    } else {
+      if(!casts[name].host || !net.isIP(casts[name].host) || net.isIP(casts[name].host) == 4){ // prefer ipv4
+        casts[name].host = host
+        casts[name].xml = xml
+        casts[name].emitted = false // re-emit with the new host
+        return emit(casts[name])
+      }
+    }
+  }
   
   that.update = () => {
     const finder = new RendererFinder()
@@ -188,28 +202,29 @@ module.exports = function (ip, knownDevices) {
       const host = info.address
       const xml = msg.location
       const name = desc.device.friendlyName
-      const headers = {}
-      if (!casts[name]) {
-        casts[name] = {name, host, xml, headers}
-        return emit(casts[name])
-      } else {
-        if(!casts[name].host || !net.isIP(casts[name].host) || net.isIP(casts[name].host) == 4){ // prefer ipv4
-          casts[name].host = host
-          casts[name].xml = xml
-          casts[name].headers = headers
-          casts[name].emitted = false // re-emit with the new host
-          return emit(casts[name])
-        }
-      }
+      found(name, host, xml)
     })
     finder.start(true)
+  }
+
+  that.validate = (name, host, xml) => {
+    if (!casts[name]) {
+      http.get(xml, res => {
+        const {statusCode} = res
+        if (statusCode == 200) {
+          if (!casts[name]) {
+            found(name, host, xml)
+          }
+        }
+        res.resume()
+      }).on('error', e => {})
+    }
   }
 
   that.destroy = function () {
   }
 
   that.update()
-
 
   return that
 }
