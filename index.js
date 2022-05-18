@@ -11,6 +11,7 @@ const noop = function () {}
 module.exports = function () {
   const that = new events.EventEmitter()
   const casts = {}
+  let finder
 
   that.players = []
 
@@ -197,7 +198,12 @@ module.exports = function () {
   }
   
   that.update = () => {
-    const finder = new RendererFinder()
+    that.search()
+  }
+  
+  that.search = () => {
+    if(finder) return
+    finder = new RendererFinder()
     finder.on('found', (info, msg, desc) => {
       const host = info.address
       const xml = msg.location
@@ -205,6 +211,11 @@ module.exports = function () {
       found(name, host, xml)
     })
     finder.start(true)
+  }
+  
+  that.stopSearching = () => {
+    finder && finder.stop()
+    finder = null
   }
 
   that.validate = (name, host, xml) => {
