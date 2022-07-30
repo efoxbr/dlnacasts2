@@ -26,7 +26,7 @@
     "mime": "^1.3.4",
     "run-parallel": "^1.1.6",
     "thunky": "^0.1.0",
-    "upnp-mediarenderer-client": "^1.4.0",
+    "upnp-mediarenderer-client": "github:efoxbr/node-upnp-mediarenderer-client",
     "renderer-finder": "github:efoxbr/renderer-finder"
   },
   "devDependencies": {
