@@ -205,11 +205,14 @@ module.exports = function () {
     if(finder) return
     finder = new RendererFinder()
     finder.on('found', (info, msg, desc) => {
+      console.warn('found', info, msg, desc)
+      if(!desc) return
       const host = info.address
       const xml = msg.location
-      const name = desc.device.friendlyName
+      const name = desc && desc.device ? desc.device.friendlyName : info.address
       found(name, host, xml)
     })
+    finder.on('error', console.error)
     finder.start(true)
   }
   
