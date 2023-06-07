@@ -4,7 +4,7 @@ const mime = require('mime')
 const parallel = require('run-parallel')
 const net = require('net')
 const http   = require('http')
-const RendererFinder = require('renderer-finder');
+const Finder = require('./finder');
 const thunky = require('thunky')
 const noop = function () {}
 
@@ -203,22 +203,21 @@ module.exports = function () {
   
   that.search = () => {
     if(finder) return
-    finder = new RendererFinder()
-    finder.on('found', (info, msg, desc) => {
-      console.warn('found', info, msg, desc)
-      if(!desc) return
-      const host = info.address
-      const xml = msg.location
-      const name = desc && desc.device ? desc.device.friendlyName : info.address
+    finder = new Finder()
+    finder.on('device', device => {
+      const host = device.address
+      const xml = device.xml
+      const name = device.name
       found(name, host, xml)
     })
-    finder.on('error', console.error)
-    finder.start(true)
+    finder.start()
   }
   
   that.stopSearching = () => {
-    finder && finder.stop()
-    finder = null
+    if(finder) {
+        finder.destroy()
+        finder = null
+    }
   }
 
   that.validate = (name, host, xml) => {
