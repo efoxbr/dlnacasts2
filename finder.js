@@ -45,7 +45,7 @@ class Finder extends EventEmitter {
     async start() {
         const port = await getPort();
         this._upnpSSDP = new SSDP(port);      
-        const result = await search(this._upnpSSDP);
+        const result = await this.search(this._upnpSSDP);
         const { headers, rinfo, xml } = result;
 
         const name = getXmlArg('friendlyName', xml);
